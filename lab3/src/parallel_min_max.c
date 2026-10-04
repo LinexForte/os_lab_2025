@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include <sys/time.h>
 #include <sys/types.h>
@@ -15,16 +16,30 @@
 #include "find_min_max.h"
 #include "utils.h"
 
+pid_t child_pids[100];
+int child_count = 0;
+
+void kill_children(int sig) {
+  (void)sig;
+  for (int i = 0; i < child_count; i++) {
+    if (child_pids[i] > 0) {
+      kill(child_pids[i], SIGKILL);
+    }
+  }
+}
+
 int main(int argc, char **argv) {
   int seed = -1;
   int array_size = -1;
   int pnum = -1;
+  int timeout = -1;
   bool with_files = false;
 
   while (true) {
     static struct option options[] = {{"seed", required_argument, 0, 0},
                                       {"array_size", required_argument, 0, 0},
                                       {"pnum", required_argument, 0, 0},
+                                      {"timeout", required_argument, 0, 0},
                                       {"by_files", no_argument, 0, 'f'},
                                       {0, 0, 0, 0}};
 
@@ -58,6 +73,13 @@ int main(int argc, char **argv) {
             }
             break;
           case 3:
+            timeout = atoi(optarg);
+            if (timeout <= 0) {
+              printf("timeout must be a positive number\n");
+              return 1;
+            }
+            break;
+          case 4:
             with_files = true;
             break;
           default:
@@ -82,7 +104,7 @@ int main(int argc, char **argv) {
   }
 
   if (seed == -1 || array_size == -1 || pnum == -1) {
-    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" [--by_files]\n",
+    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" [--timeout \"num\"] [--by_files]\n",
            argv[0]);
     return 1;
   }
@@ -108,6 +130,11 @@ int main(int argc, char **argv) {
 
   int active_child_processes = 0;
 
+  if (timeout > 0) {
+    signal(SIGALRM, kill_children);
+    alarm(timeout);
+  }
+
   struct timeval start_time;
   gettimeofday(&start_time, NULL);
 
@@ -118,6 +145,7 @@ int main(int argc, char **argv) {
     pid_t child_pid = fork();
     if (child_pid >= 0) {
       active_child_processes += 1;
+      child_pids[child_count++] = child_pid;
       if (child_pid == 0) {
         int begin = i * chunk + (i < remainder ? i : remainder);
         int end = begin + chunk + (i < remainder ? 1 : 0);
@@ -158,10 +186,17 @@ int main(int argc, char **argv) {
 
   while (active_child_processes > 0) {
     int status;
-    pid_t pid = wait(&status);
+    pid_t pid = waitpid(-1, &status, 0);
     if (pid > 0) {
       active_child_processes -= 1;
+      for (int i = 0; i < child_count; i++) {
+        if (child_pids[i] == pid) child_pids[i] = 0;
+      }
     }
+  }
+
+  if (timeout > 0) {
+    alarm(0);
   }
 
   struct MinMax min_max;
@@ -175,18 +210,21 @@ int main(int argc, char **argv) {
     if (with_files) {
       FILE *f = fopen(file_names[i], "r");
       if (!f) {
-        perror("fopen for reading");
         continue;
       }
-      fscanf(f, "%d %d", &min, &max);
+      if (fscanf(f, "%d %d", &min, &max) != 2) {
+        fclose(f);
+        continue;
+      }
       fclose(f);
       remove(file_names[i]);
     } else {
       struct MinMax child_res;
-      read(pipes[i][0], &child_res, sizeof(child_res));
+      if (read(pipes[i][0], &child_res, sizeof(child_res)) == sizeof(child_res)) {
+        min = child_res.min;
+        max = child_res.max;
+      }
       close(pipes[i][0]);
-      min = child_res.min;
-      max = child_res.max;
     }
 
     if (min < min_max.min) min_max.min = min;
